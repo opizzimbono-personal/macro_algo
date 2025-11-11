@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, List, Dict, Optional
+
+import pandas as pd
+
+from loaders.fred_loader import fetch_fred_series
+from loaders.worldbank_loader import fetch_wb_indicator
+from loaders.imf_loader import fetch_imf_series
+from loaders.oecd_loader import fetch_oecd_csv
+from loaders.bis_loader import fetch_bis_csv, bis_csv_to_timeseries
+from config import DEFAULT_START, DEFAULT_END
+
+
+# ---------- MetricSpec ----------
+
+@dataclass
+class MetricSpec:
+    """
+    Defines one 1D time series used in the design matrix.
+    loader: no-arg callable returning Series or 1-col DataFrame.
+    """
+    name: str
+    category: str
+    source: str
+    frequency: str
+    description: str
+    loader: Callable[[], pd.Series]
+
+
+# ---------- Helper: Wrap loaders into 1D series ----------
+
+def _ensure_series(x: pd.Series | pd.DataFrame, name: str) -> pd.Series:
+    if isinstance(x, pd.Series):
+        s = x.copy()
+    else:
+        if x.shape[1] != 1:
+            raise ValueError(f"Metric {name} loader returned multi-col DataFrame.")
+        s = x.iloc[:, 0].copy()
+    s.name = name
+    return s.sort_index()
+
+
+# ---------- US Metric Set (core, runs out-of-box) ----------
+
+def _us_metrics() -> List[MetricSpec]:
+    """
+    Core US metrics directly backing the narrative:
+    Immigration, wages, jobs, consumption, inflation, expectations,
+    cash/assets proxies, IG spreads, productivity, activity.
+    All from stable free APIs (FRED, World Bank).
+    """
+
+    metrics: List[MetricSpec] = []
+
+    # 1) Immigration (UN DESA via World Bank re-pack)
+    # World Bank: Net migration (SM.POP.NETM), annual.
+    def _us_net_migration():
+        df = fetch_wb_indicator("SM.POP.NETM", "US", 1960, 2050)
+        if df.empty:
+            return pd.Series(dtype=float, name="us_net_migration_wb")
+        return _ensure_series(df["US"], "us_net_migration_wb")
+
+    metrics.append(
+        MetricSpec(
+            name="us_net_migration_wb",
+            category="immigration",
+            source="WorldBank (UN DESA re-pack)",
+            frequency="A",
+            description="US net migration (annual), WB indicator SM.POP.NETM.",
+            loader=_us_net_migration,
+        )
+    )
+
+    # 2) Wages (FRED)
+    # Average Hourly Earnings, Total Private
+    metrics.append(
+        MetricSpec(
+            name="us_avg_hourly_earnings",
+            category="wages",
+            source="FRED: CEU0500000003",
+            frequency="M",
+            description="US Avg Hourly Earnings, Total Private.",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("CEU0500000003"), "us_avg_hourly_earnings"
+            ),
+        )
+    )
+
+    # 3) Jobs / Labor market
+    metrics.append(
+        MetricSpec(
+            name="us_unemployment_rate",
+            category="jobs",
+            source="FRED: UNRATE",
+            frequency="M",
+            description="US Unemployment Rate (U-3).",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("UNRATE"), "us_unemployment_rate"
+            ),
+        )
+    )
+
+    metrics.append(
+        MetricSpec(
+            name="us_nonfarm_payrolls",
+            category="jobs",
+            source="FRED: PAYEMS",
+            frequency="M",
+            description="US All Employees: Total Nonfarm Payrolls.",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("PAYEMS"), "us_nonfarm_payrolls"
+            ),
+        )
+    )
+
+    # 4) Consumption (lead/lag vs wages, jobs)
+    metrics.append(
+        MetricSpec(
+            name="us_real_pce",
+            category="consumption",
+            source="FRED: PCEC96",
+            frequency="M",
+            description="US Real Personal Consumption Expenditures.",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("PCEC96"), "us_real_pce"
+            ),
+        )
+    )
+
+    # 5) Inflation vs Wages vs Jobs
+    metrics.append(
+        MetricSpec(
+            name="us_cpi_all_items",
+            category="inflation",
+            source="FRED: CPIAUCSL",
+            frequency="M",
+            description="US CPI All Items, SA.",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("CPIAUCSL"), "us_cpi_all_items"
+            ),
+        )
+    )
+
+    # 6) Inflation Expectations (survey + market)
+    # UMich 1y expected inflation
+    metrics.append(
+        MetricSpec(
+            name="us_mich_exp_inflation",
+            category="inflation_expectations_survey",
+            source="FRED: MICH",
+            frequency="M",
+            description="UMich median 1y inflation expectations.",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("MICH"), "us_mich_exp_inflation"
+            ),
+        )
+    )
+
+    # 5y5y market-based
+    metrics.append(
+        MetricSpec(
+            name="us_5y5y_fwd_infl",
+            category="inflation_expectations_market",
+            source="FRED: T5YIFR",
+            frequency="D",
+            description="5-Year, 5-Year Forward Inflation Expectation Rate.",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("T5YIFR"), "us_5y5y_fwd_infl"
+            ),
+        )
+    )
+
+    # 7) Cash & Assets (proxy using monetary aggregates / household assets)
+    # Simple starter: checkable deposits & currency of households & nonprofits
+    # BOGZ1FL153020005Q is one common series; we use it as illustration.
+    def _us_household_liquid_assets():
+        s = fetch_fred_series("BOGZ1FL153020005Q")  # Quarterly
+        return _ensure_series(s, "us_household_liquid_assets")
+
+    metrics.append(
+        MetricSpec(
+            name="us_household_liquid_assets",
+            category="cash_assets",
+            source="FRED: BOGZ1FL153020005Q",
+            frequency="Q",
+            description="US Household & nonprofit checkable deposits and currency (proxy cash).",
+            loader=_us_household_liquid_assets,
+        )
+    )
+
+    # 8) IG Spreads (ICE BofA US IG OAS)
+    metrics.append(
+        MetricSpec(
+            name="us_ig_oas",
+            category="ig_spreads",
+            source="FRED: BAMLC0A0CM",
+            frequency="D",
+            description="ICE BofA US Corporate Index Option-Adjusted Spread.",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("BAMLC0A0CM"), "us_ig_oas"
+            ),
+        )
+    )
+
+    # 9) Productivity
+    metrics.append(
+        MetricSpec(
+            name="us_nonfarm_productivity",
+            category="productivity",
+            source="FRED: OPHNFB",
+            frequency="Q",
+            description="Nonfarm Business Sector: Labor Productivity (Output per Hour).",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("OPHNFB"), "us_nonfarm_productivity"
+            ),
+        )
+    )
+
+    # 10) Real-time activity: Airports proxy
+    metrics.append(
+        MetricSpec(
+            name="us_enplanements",
+            category="activity_high_freq",
+            source="FRED: ENPLANE",
+            frequency="M",
+            description="Enplanements for US air carriers (domestic+intl).",
+            loader=lambda: _ensure_series(
+                fetch_fred_series("ENPLANE"), "us_enplanements"
+            ),
+        )
+    )
+
+    # ----- OPTIONAL / EXTENDED (IMF/OECD/BIS/r*/margin etc.) -----
+    # These are here to satisfy coverage of your source list;
+    # keep them commented out or call them explicitly so they don't break core runs.
+
+    # Example IMF CPI for US & CA (uncomment if you confirm key structure)
+    # def _imf_us_can_cpi_food():
+    #     df = fetch_imf_series("CPI", "USA+CAN.CPI.CP01.IX.M", start_period="1990")
+    #     return df
+
+    # Example BIS debt securities snippet (requires picking correct path/params)
+    # def _bis_us_debt_securities():
+    #     df = fetch_bis_csv(
+    #         "/api/v1/bis-stats/ws_debt_sec/webservice",
+    #         params={"location": "US", "format": "csv"},
+    #     )
+    #     return bis_csv_to_timeseries(df)
+    #
+    # metrics.append(...)
+
+    return metrics
+
+
+# ---------- Public API ----------
+
+def get_metric_specs(country: str = "US") -> List[MetricSpec]:
+    """
+    Return list of MetricSpec for given country.
+    For now, US is fully wired; other countries can be added similarly.
+    """
+    c = country.upper()
+    if c == "US":
+        return _us_metrics()
+    # Placeholder for future multi-country extension:
+    # if c in ("GB", "UK"): ...
+    # if c in ("DE", "EA19"): ...
+    return []
